@@ -8,6 +8,7 @@ import datetime
 import numpy as np
 from scipy.fft import rfft, rfftfreq
 from flask import Flask, jsonify, render_template, request
+from ml.pipeline import ml_pipeline
 
 # Create dataset directory if it doesn't exist
 DATASET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dataset')
@@ -131,7 +132,10 @@ def serial_reader():
                                 sensor_data['gx_dps'] = gx_dps
                                 sensor_data['gy_dps'] = gy_dps
                                 sensor_data['gz_dps'] = gz_dps
-                        
+
+                            # Feed into ML pipeline (non-blocking)
+                            ml_pipeline.feed(ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps)
+
                     except (ValueError, IndexError):
                         pass # Ignore malformed packets quietly to avoid flooding the console
                         
@@ -276,19 +280,31 @@ def index():
 def log_data():
     global pending_label_window
     data = request.json
-    label = data.get('label', 'Unknown')
-    
+    label     = data.get('label', 'Unknown')
+    window_id = data.get('window_id')   # present only for ML-triggered requests
+
+    # --- ML pipeline label routing ---
+    if window_id:
+        ml_label = label if label in ('normal', 'tremor') else None
+        if ml_label is None:
+            return jsonify({"status": "error", "message": f"Unknown label '{label}'"})
+        result = ml_pipeline.submit_label(window_id, ml_label)
+        with data_lock:
+            sensor_data['needs_label'] = False
+        return jsonify(result)
+
+    # --- Original DSP-based label routing (unchanged) ---
     with data_lock:
         sensor_data['needs_label'] = False # Reset the UI flag
-        
+
     if not pending_label_window['x']:
         return jsonify({"status": "error", "message": "No pending data"})
-        
+
     # Save the window to a CSV
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"{label}_{timestamp}.csv"
     filepath = os.path.join(DATASET_DIR, filename)
-    
+
     with open(filepath, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['ax_g', 'ay_g', 'az_g'])
@@ -298,7 +314,7 @@ def log_data():
                 pending_label_window['y'][i],
                 pending_label_window['z'][i]
             ])
-            
+
     # Clear the pending window
     pending_label_window = {'x': [], 'y': [], 'z': []}
     print(f"Data successfully saved to {filepath}")
@@ -307,16 +323,27 @@ def log_data():
 @app.route('/data')
 def get_data():
     with data_lock:
-        return jsonify(sensor_data)
+        response = dict(sensor_data)
+    # Merge ML predictions — always present, null when not yet active
+    response.update(ml_pipeline.latest_prediction())
+    return jsonify(response)
+
+
+@app.route('/ml_status')
+def ml_status():
+    """Debug endpoint — returns full ML pipeline status."""
+    return jsonify(ml_pipeline.status())
 
 if __name__ == '__main__':
     # Start the serial reading loop in a daemon thread
     thread = threading.Thread(target=serial_reader, daemon=True)
     thread.start()
-    
+
     # Start the FFT DSP worker thread
     dsp_thread = threading.Thread(target=dsp_worker, daemon=True)
     dsp_thread.start()
-    
+
+    ml_pipeline.start()
+
     # Run the web server
     app.run(host='0.0.0.0', port=5000, debug=False)

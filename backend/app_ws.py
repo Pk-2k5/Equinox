@@ -8,6 +8,7 @@ import numpy as np
 from scipy.fft import rfft, rfftfreq
 from flask import Flask, jsonify, render_template, request
 import websocket  # websocket-client library
+from ml.pipeline import ml_pipeline
 
 # --- Configuration ---
 # The ESP32 hotspot assigns itself 192.168.4.1 by default
@@ -106,9 +107,12 @@ def process_sensor_line(line):
                 sensor_data['gx_dps'] = gx_dps
                 sensor_data['gy_dps'] = gy_dps
                 sensor_data['gz_dps'] = gz_dps
-        
+
+            # Feed into ML pipeline (non-blocking)
+            ml_pipeline.feed(ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps)
+
     except (ValueError, IndexError):
-        pass 
+        pass
 
 
 def websocket_reader():
@@ -261,18 +265,33 @@ def index():
 def log_data():
     global pending_label_window
     data = request.json
-    label = data.get('label', 'Unknown')
-    
+    label     = data.get('label', 'Unknown')
+    window_id = data.get('window_id')   # present only for ML-triggered requests
+
+    # --- ML pipeline label routing ---
+    # If a window_id is present this label came from the ML system.
+    # Route it through feedback manager (baseline + storage) and return early.
+    if window_id:
+        # Normalise label to what ML system expects
+        ml_label = label if label in ('normal', 'tremor') else None
+        if ml_label is None:
+            return jsonify({"status": "error", "message": f"Unknown label '{label}'"})
+        result = ml_pipeline.submit_label(window_id, ml_label)
+        with data_lock:
+            sensor_data['needs_label'] = False
+        return jsonify(result)
+
+    # --- Original DSP-based label routing (unchanged) ---
     with data_lock:
         sensor_data['needs_label'] = False # Reset the UI flag
-        
+
     if not pending_label_window['x']:
         return jsonify({"status": "error", "message": "No pending data"})
-        
+
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"{label}_{timestamp}.csv"
     filepath = os.path.join(DATASET_DIR, filename)
-    
+
     with open(filepath, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['ax_g', 'ay_g', 'az_g'])
@@ -282,7 +301,7 @@ def log_data():
                 pending_label_window['y'][i],
                 pending_label_window['z'][i]
             ])
-            
+
     pending_label_window = {'x': [], 'y': [], 'z': []}
     print(f"Data successfully saved to {filepath}")
     return jsonify({"status": "success", "message": f"Saved {filename}"})
@@ -290,14 +309,25 @@ def log_data():
 @app.route('/data')
 def get_data():
     with data_lock:
-        return jsonify(sensor_data)
+        response = dict(sensor_data)
+    # Merge ML predictions — always present, null when not yet active
+    response.update(ml_pipeline.latest_prediction())
+    return jsonify(response)
+
+
+@app.route('/ml_status')
+def ml_status():
+    """Debug endpoint — returns full ML pipeline status."""
+    return jsonify(ml_pipeline.status())
 
 
 if __name__ == '__main__':
     thread = threading.Thread(target=websocket_reader, daemon=True)
     thread.start()
-    
+
     dsp_thread = threading.Thread(target=dsp_worker, daemon=True)
     dsp_thread.start()
-    
+
+    ml_pipeline.start()
+
     app.run(host='0.0.0.0', port=5000, debug=False)
